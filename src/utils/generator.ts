@@ -1,6 +1,6 @@
 import { parse } from "yamljs";
-import axios, { AxiosStatic } from "axios";
-import * as zod from "zod";
+import { dirname, resolve, extname } from "path";
+import * as fs from "fs";
 
 export type AutoTrim = "start-end" | "all" | boolean;
 
@@ -9,22 +9,28 @@ export type WriteOptions = StringConvertionOptions & { autoTrim?: AutoTrim };
 export type TemplateConfigs = { output: string; generator: string };
 
 export type GenerationContext = {
-  texts: string[];
-  options: WriteOptions;
-  data: unknown;
-  axios: AxiosStatic;
-  $use: Function;
-  $each: Function;
-  write(...values: any[]): unknown;
+  readonly dataFile: string;
+  readonly texts: string[];
+  readonly options: WriteOptions;
+  readonly data: any;
+  readonly key: any;
+  $each: typeof $each;
+  $use: typeof $use;
+  extends(data: unknown, extraProps?: unknown): GenerationContext;
+  write(...values: any[]): any;
   configure(options: WriteOptions): void;
 };
 
-export type EachOptions = {
-  separator?: TextGenerator;
+export type EachOptions<T> = {
+  sep?: TextGenerator<T>;
+  start?: TextGenerator<T>;
+  end?: TextGenerator<T>;
+  alt?: TextGenerator<T>;
+  extra?: any;
 };
 
-export type TextGenerator = (
-  context: GenerationContext
+export type TextGenerator<TExtra> = (
+  context: GenerationContext & TExtra
 ) => void | Promise<void>;
 
 export type StringConvertionOptions = {};
@@ -33,89 +39,158 @@ const isDataFile = (content: string) => {
   return content.trimStart().startsWith("# ymlgen");
 };
 
-const readConfigs = (content: string) => {
-  let output: string = "";
-  let generator: string = "";
+const readConfigs = (dir: string, content: string) => {
+  let defaultOutput: string = "";
+  let defaultGenerator: string = "";
+  let defaultSelect: string = "";
+  const importedData: unknown[] = [];
+  const generators: { output: string; name: string; select: string }[] = [];
 
-  content.replace(/# ymlgen:([^\s]+) ([^\n]+)/g, (_, name, value) => {
+  content.replace(/# ymlgen:([^\s]+) ([^\n]+)/g, (_, name, value: string) => {
     value = value.trim();
     switch (name) {
+      case "import":
+        const importFilePath = resolve(dir, value);
+        const importFileContent = fs.readFileSync(importFilePath, "utf-8");
+        const importExt = (extname(value) ?? "").toLowerCase();
+        const data = importExt.endsWith(".json")
+          ? // support JSON file
+            JSON.parse(importFileContent)
+          : // unless using yaml parser
+            parse(importFileContent);
+        importedData.push(data);
+        break;
       case "output":
-        output = value;
+        defaultOutput = value;
+        break;
+      case "select":
+        defaultSelect = value;
         break;
       case "generator":
-        generator = value;
+        // custom generator
+        if (value.startsWith("{") && value.endsWith("}")) {
+          generators.push(parse(value));
+        } else {
+          defaultGenerator = value;
+        }
         break;
       default:
         throw new Error(`Invalid config ${name}`);
     }
     return "";
   });
-  if (!generator) {
+
+  if (defaultGenerator) {
+    if (!defaultOutput) {
+      throw new Error("No ymlgen:output config found");
+    }
+    generators.push({
+      name: defaultGenerator,
+      output: defaultOutput,
+      select: defaultSelect,
+    });
+  }
+
+  if (!generators.length) {
     throw new Error("No ymlgen:generator config found");
   }
-  if (!output) {
-    throw new Error("No ymlgen:output config found");
-  }
-  return { output, generator };
+  return { generators, importedData };
 };
 
 const convertToString = (value: unknown, options: StringConvertionOptions) => {
   return typeof value === "undefined" || value === null ? "" : String(value);
 };
 
-const processFile = async (
-  fileName: string,
-  content: string,
-  getGenerator: (generatorName: string) => Promise<TextGenerator>,
-  writeFile: (fileName: string, content: string) => Promise<void>
-) => {
-  const configs = readConfigs(content);
-  const isMultipleOutput = configs.output.includes("**");
-  const data = parse(content);
-
-  if (!data) {
-    // invalid data
-    return;
+const selectData = (data: any, path: string) => {
+  if (!path) {
+    return data;
   }
-
-  const generator = await getGenerator(configs.generator);
-
-  if (isMultipleOutput) {
-    const promises = Object.keys(data).map(async (key) => {
-      const subData = data[key];
-      const [fileName, generatorName] = key.split("");
-      const customGenerator = generatorName
-        ? await getGenerator(generatorName)
-        : generator;
-      const content = await generateText(subData, customGenerator);
-      await writeFile(configs.output.replace("**", fileName), content);
-    });
-    return Promise.all(promises);
-  }
-
-  const generatedText = await generateText(data, generator);
-  await writeFile(configs.output.replace("*", fileName), generatedText);
+  return path.split(".").reduce((prev, p) => prev?.[p], data);
 };
 
-const generateText = async (data: unknown, generator: TextGenerator) => {
+const processFile = async <T>(
+  dataFile: string,
+  fileName: string,
+  content: string,
+  getGenerator: (generatorName: string) => Promise<TextGenerator<T>>,
+  writeFile: (fileName: string, content: string) => Promise<void>
+) => {
+  const configs = readConfigs(dirname(dataFile), content);
+
+  await Promise.all(
+    configs.generators.map(async (g) => {
+      const isMultipleOutput = g.output.includes("**");
+      const data = parse(content);
+
+      if (!data) {
+        // invalid data
+        return;
+      }
+
+      const generator = await getGenerator(g.name);
+
+      if (isMultipleOutput) {
+        const privateData = {};
+        const promises = Object.keys(data).map(async (key) => {
+          const subData = data[key];
+          // skip private key
+          if (key[0] === "__") {
+            Object.assign(privateData, { [key]: subData });
+            return;
+          }
+          const selectedData = selectData(subData, g.select);
+          Object.assign(selectedData, ...configs.importedData, privateData);
+          const [fileName, generatorName] = key.split(":");
+          const customGenerator = generatorName
+            ? await getGenerator(generatorName)
+            : generator;
+          const content = await generateText(
+            dataFile,
+            selectedData,
+            customGenerator
+          );
+          await writeFile(g.output.replace("**", fileName), content);
+        });
+        return Promise.all(promises);
+      }
+      const selectedData = selectData(data, g.select);
+      Object.assign(selectedData, ...configs.importedData);
+      const generatedText = await generateText(
+        dataFile,
+        selectedData,
+        generator
+      );
+      await writeFile(g.output.replace("*", fileName), generatedText);
+    })
+  );
+};
+
+const generateText = async <T>(
+  dataFile: string,
+  data: unknown,
+  generator: TextGenerator<T>
+) => {
   const texts: string[] = [];
   const options: WriteOptions = {};
-  const context: GenerationContext = createContext(texts, data, options);
-  await generator(context);
+  const context: GenerationContext = createContext(
+    dataFile,
+    texts,
+    data,
+    options
+  );
+  await generator(context as any);
   return texts.join("");
 };
 
-const $use = (data: unknown, generator: TextGenerator): TextGenerator => {
-  return (context) =>
-    generator(createContext(context.texts, data, context.options));
+const $use = <T>(data: unknown, generator: TextGenerator<T>) => {
+  return (context: GenerationContext) => context.extends(data).write(generator);
 };
 
-const $each = (
+const $each = <T>(
   data: unknown,
-  generator: TextGenerator,
-  options: EachOptions = {}
-): TextGenerator => {
+  generator: TextGenerator<T>,
+  options: EachOptions<T> = {}
+): TextGenerator<T> => {
   return async (context) => {
     if (!data) {
       throw new Error(
@@ -123,35 +198,59 @@ const $each = (
       );
     }
     let first = true;
+    let alt = false;
     for (const [key, value] of Object.entries(data as any)) {
-      if (!first && options.separator) {
-        await options.separator(
-          createContext(context.texts, value, context.options, { key })
-        );
+      if (first && options.start) {
+        await context.extends(data, options.extra).write(options.start);
       }
-      await generator(
-        createContext(context.texts, value, context.options, { key })
-      );
+
+      if (!first && options.sep) {
+        await context
+          .extends(value, { ...options.extra, key })
+          .write(options.sep);
+      }
+
+      if (alt && options.alt) {
+        await context
+          .extends(value, { ...options.extra, key })
+          .write(options.alt);
+      } else {
+        await context
+          .extends(value, { ...options.extra, key })
+          .write(generator);
+      }
+      alt = !alt;
       first = false;
+    }
+
+    if (first && options.end) {
+      await context.extends(data, options.extra).write(options.end);
     }
   };
 };
 
 const createContext = (
+  dataFile: string,
   texts: string[],
   data: unknown,
   options: WriteOptions,
   extraProps?: Record<string, unknown>
 ): GenerationContext => {
   const context = {
+    key: undefined,
     ...extraProps,
+    dataFile,
     texts,
-    axios,
-    zod,
     data,
     options,
     $each,
     $use,
+    extends(newData: unknown, newExtraProps?: any) {
+      return createContext(dataFile, texts, newData, options, {
+        ...extraProps,
+        ...newExtraProps,
+      });
+    },
     configure(newOptions: WriteOptions) {
       Object.assign(options, newOptions);
     },

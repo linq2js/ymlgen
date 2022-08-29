@@ -6,7 +6,6 @@ import { extname, basename, resolve, dirname, join } from "path";
 import { createCallbackGroup } from "./utils/createCallbackGroup";
 import { isDataFile, processFile, TextGenerator } from "./utils/generator";
 
-const SUPPORTED_EXTENSIONS = [".yaml", ".yml", ".YAML", ".YML"];
 const generatorCache = new Map<string, Function>();
 let generatorCacheExpiry = 0;
 
@@ -36,11 +35,6 @@ export function activate(context: vscode.ExtensionContext) {
         }
 
         const ext = extname(path);
-
-        if (!SUPPORTED_EXTENSIONS.includes(ext)) {
-          return;
-        }
-
         const content = document.getText();
 
         if (!content) {
@@ -55,6 +49,7 @@ export function activate(context: vscode.ExtensionContext) {
           const fileName = basename(path, ext);
 
           await processFile(
+            path,
             fileName,
             content,
             (generatorName: string) =>
@@ -98,41 +93,26 @@ export function activate(context: vscode.ExtensionContext) {
   context.subscriptions.push({ dispose: dispose.call });
 }
 
+const requireUncached = <T>(path: string) => {
+  const resolvedPath = require.resolve(path);
+  delete require.cache[resolvedPath];
+  return require(path) as T;
+};
+
 const findGenerator = async (
   generatorName: string,
   workspaceFolder: string
-): Promise<TextGenerator> => {
+): Promise<TextGenerator<any>> => {
   if (!generatorCacheExpiry || generatorCacheExpiry < Date.now()) {
     generatorCache.clear();
   }
 
-  let generator = generatorCache.get(generatorName);
-  if (!generator) {
-    const generatorPath = join(
-      workspaceFolder,
-      `.ymlgen/generators/${generatorName}.js`
-    );
+  const generatorPath = join(
+    workspaceFolder,
+    `.ymlgen/generators/${generatorName}.js`
+  );
 
-    if (fs.existsSync(generatorPath)) {
-      Object.assign(globalThis, {
-        defineGenerator(generator: Function) {
-          generatorCache.set(generatorName, generator);
-        },
-      });
-      const script = fs.readFileSync(generatorPath, "utf-8");
-      eval(`(function(){${script}})()`);
-      generator = generatorCache.get(generatorName);
-    }
-  }
-  if (!generator) {
-    throw new Error(`Cannot find ${generatorName}`);
-  }
-
-  const gen = generator;
-
-  return (context) => {
-    return gen(context);
-  };
+  return requireUncached<TextGenerator<any>>(generatorPath);
 };
 
 // this method is called when your extension is deactivated

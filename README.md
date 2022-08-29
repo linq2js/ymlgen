@@ -5,6 +5,7 @@ A generator for YML/YAML files
 ## Features
 
 - Generate one or many files from YML/YAML config file
+- Async rendering supported
 
 ## Requirements
 
@@ -17,28 +18,11 @@ A generator for YML/YAML files
    const writeItem = ({ write, key, data }) => write(`<li>${key}:${data}</li>`);
    const writeSeparator = ({ write }) => write("<li>---</li>");
 
-   globalThis.defineGenerator(async (context) => {
-     const {
-       // write text to output file
-       write,
-       // helper
-       $each,
-       // the data is parsed from YML file
-       data,
-       // for fetching remote data purpose
-       axios,
-       // for schema validation purpose
-       zod,
-     } = context;
-     // write string template
-     await write()`<ul>`;
-     await write(
-       // data is array now, using $each helper to renders all data items
-       $each(data, writeItem, { separator: writeSeparator })
-     );
-     // write simple value
-     await write("</ul>");
-   });
+   // using nodejs export style
+   module.exports = async (context) => {
+     const { data, write } = context;
+     write("Something");
+   };
    ```
 
 5. Create template file, a template file must be YML/YAML file
@@ -53,13 +37,33 @@ Example:
 `/yourWorkspaceDir/.ymlgen/generators/list.js`
 
 ```js
-globalThis.defineGenerator(async ({ write, data }) => {
-  await write("<ul>");
-  for (const item of data) {
-    await write(`<li>${item}</li>`);
-  }
+const writeItem = ({ write, key, data }) => write(`<li>${key}:${data}</li>`);
+const writeSeparator = ({ write }) => write("<li>---</li>");
+
+// using nodejs export style
+module.exports = async (context) => {
+  const {
+    // write text to output file
+    write,
+    // helper
+    $each,
+    // the data is parsed from YML file
+    data,
+    // for fetching remote data purpose
+    axios,
+    // for schema validation purpose
+    zod,
+  } = context;
+
+  // write string template
+  await write()`<ul>`;
+  await write(
+    // data is array now, using $each helper to renders all data items
+    $each(data, writeItem, { sep: writeSeparator })
+  );
+  // write simple value
   await write("</ul>");
-});
+};
 ```
 
 `/yourWorkspaceDir/test/list.yml`
@@ -72,7 +76,7 @@ globalThis.defineGenerator(async ({ write, data }) => {
 - item4
 ```
 
-After saving the yml, ymlgen will create new file that locates in `/yourWorkspaceDir/test/list.html`
+After saving the yml file, `ymlgen` will create new file that locates in `/yourWorkspaceDir/test/list.html`
 
 ```html
 <ul>
@@ -90,8 +94,37 @@ After saving the yml, ymlgen will create new file that locates in `/yourWorkspac
 
 ## Known Issues
 
-- No imports supported
-
 ## Release Notes
+
+### 1.0.3
+
+- Reuse private data for separated data object
+
+  Data file
+
+  ```yaml
+  # ymlgen:output **.js
+
+  __privateData: 1
+  file1: # data for file1.js
+    items:
+      - 1
+      - 2
+      - 3
+  file2: # data for file2.js
+    items:
+      - 4
+      - 5
+      - 6
+  ```
+
+  Generator file
+
+  ```js
+  module.exports = (context) => {
+    console.log(context.data.__privateData); // 1
+    console.log(context.data.items); // [1, 2, 3]
+  };
+  ```
 
 ---
